@@ -7,47 +7,69 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { generateGameCode, generateWordPair } from "@/lib/game-utils"
+import { supabase } from "@/lib/supabase"
+import { useToast } from "@/hooks/use-toast"
 
 export default function CreateGamePage() {
   const router = useRouter()
+  const { toast } = useToast()
   const [playerCount, setPlayerCount] = useState(5)
   const [mafiaCount, setMafiaCount] = useState(2)
   const [playerName, setPlayerName] = useState("")
+  const [isCreating, setIsCreating] = useState(false)
 
-  const handleCreateGame = () => {
-    if (!playerName.trim()) return
+  const handleCreateGame = async () => {
+    if (!playerName.trim() || isCreating) return
+    setIsCreating(true)
 
-    // Generate a unique game code
-    const gameCode = generateGameCode()
+    try {
+      // Generate a unique game code
+      const gameCode = generateGameCode()
 
-    // Generate word pair for the game
-    const { normalWord, mafiaWord } = generateWordPair()
+      // Generate word pair for the game
+      const { normalWord, mafiaWord } = generateWordPair()
 
-    // Create game state
-    const gameState = {
-      code: gameCode,
-      host: playerName,
-      playerCount,
-      mafiaCount,
-      players: [{ id: 1, name: playerName, isMafia: false }],
-      normalWord,
-      mafiaWord,
-      status: "lobby", // lobby, playing, ended
-      created: new Date().toISOString(),
+      // Create game state
+      const gameState = {
+        code: gameCode,
+        host: playerName,
+        playerCount,
+        mafiaCount,
+        players: [{ id: 1, name: playerName, isMafia: false }],
+        normalWord,
+        mafiaWord,
+        status: "lobby",
+        created: new Date().toISOString(),
+      }
+
+      // Store game in Supabase
+      const { error } = await supabase
+        .from('games')
+        .insert([gameState])
+
+      if (error) throw error
+
+      // Store current player in localStorage
+      localStorage.setItem(
+        "currentPlayer",
+        JSON.stringify({
+          id: 1,
+          name: playerName,
+          gameCode,
+        }),
+      )
+
+      router.push(`/lobby?code=${gameCode}`)
+    } catch (error) {
+      console.error('Error creating game:', error)
+      toast({
+        title: "Error creating game",
+        description: "Please try again.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsCreating(false)
     }
-
-    // Store game in localStorage
-    localStorage.setItem(`game_${gameCode}`, JSON.stringify(gameState))
-    localStorage.setItem(
-      "currentPlayer",
-      JSON.stringify({
-        id: 1,
-        name: playerName,
-        gameCode,
-      }),
-    )
-
-    router.push(`/lobby?code=${gameCode}`)
   }
 
   return (
@@ -135,8 +157,12 @@ export default function CreateGamePage() {
           <Button onClick={() => router.push("/")} variant="outline">
             Cancel
           </Button>
-          <Button onClick={handleCreateGame} className="ml-auto" disabled={!playerName.trim()}>
-            Create Game
+          <Button 
+            onClick={handleCreateGame} 
+            className="ml-auto" 
+            disabled={!playerName.trim() || isCreating}
+          >
+            {isCreating ? "Creating..." : "Create Game"}
           </Button>
         </CardFooter>
       </Card>

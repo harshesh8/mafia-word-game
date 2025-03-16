@@ -14,28 +14,8 @@ import {
 } from "@/components/ui/dialog"
 import { useToast } from "@/hooks/use-toast"
 import { Eye, EyeOff, Users } from "lucide-react"
-
-interface Player {
-  id: number
-  name: string
-  isMafia?: boolean
-  vote?: number
-}
-
-interface GameState {
-  code: string
-  host: string
-  playerCount: number
-  mafiaCount: number
-  players: Player[]
-  normalWord: string
-  mafiaWord: string
-  status: string
-  created: string
-  votes?: Record<number, number>
-  votingComplete?: boolean
-  mafiaRevealed?: boolean
-}
+import { supabase } from "@/lib/supabase"
+import type { GameState, Player } from "@/lib/supabase"
 
 export default function GamePage() {
   const router = useRouter()
@@ -56,161 +36,242 @@ export default function GamePage() {
       return
     }
 
-    // Load game state
-    const storedGame = localStorage.getItem(`game_${gameCode}`)
-    if (!storedGame) {
-      toast({
-        title: "Game not found",
-        description: "The game you're looking for doesn't exist.",
-        variant: "destructive",
-      })
-      router.push("/")
-      return
-    }
+    // Load game state and set up real-time subscription
+    const loadGame = async () => {
+      try {
+        // Get initial game state
+        const { data: game, error } = await supabase
+          .from('games')
+          .select('*')
+          .eq('code', gameCode)
+          .single()
 
-    const parsedGame = JSON.parse(storedGame) as GameState
-    setGameState(parsedGame)
+        if (error) throw error
 
-    // Check if player is in the game
-    const storedPlayer = localStorage.getItem("currentPlayer")
-    if (!storedPlayer) {
-      toast({
-        title: "Not in game",
-        description: "You're not part of this game.",
-        variant: "destructive",
-      })
-      router.push("/")
-      return
-    }
-
-    const player = JSON.parse(storedPlayer)
-    if (player.gameCode !== gameCode) {
-      toast({
-        title: "Wrong game",
-        description: "You're not part of this game.",
-        variant: "destructive",
-      })
-      router.push("/")
-      return
-    }
-
-    // Find player in game state
-    const playerInGame = parsedGame.players.find((p) => p.id === player.id)
-    if (!playerInGame) {
-      toast({
-        title: "Player not found",
-        description: "You're not part of this game.",
-        variant: "destructive",
-      })
-      router.push("/")
-      return
-    }
-
-    setCurrentPlayer(playerInGame)
-
-    // Set up polling to check for game updates
-    const interval = setInterval(() => {
-      const updatedGame = localStorage.getItem(`game_${gameCode}`)
-      if (updatedGame) {
-        const parsed = JSON.parse(updatedGame)
-        setGameState(parsed)
-
-        // Update current player info
-        const updatedPlayer = parsed.players.find((p) => p.id === player.id)
-        if (updatedPlayer) {
-          setCurrentPlayer(updatedPlayer)
+        if (!game) {
+          toast({
+            title: "Game not found",
+            description: "The game you're looking for doesn't exist.",
+            variant: "destructive",
+          })
+          router.push("/")
+          return
         }
 
-        // Check if voting is complete
-        if (parsed.votingComplete && !resultsOpen) {
+        setGameState(game)
+
+        // Check if player is in the game
+        const storedPlayer = localStorage.getItem("currentPlayer")
+        if (!storedPlayer) {
+          toast({
+            title: "Not in game",
+            description: "You're not part of this game.",
+            variant: "destructive",
+          })
+          router.push("/")
+          return
+        }
+
+        const player = JSON.parse(storedPlayer)
+        if (player.gameCode !== gameCode) {
+          toast({
+            title: "Wrong game",
+            description: "You're not part of this game.",
+            variant: "destructive",
+          })
+          router.push("/")
+          return
+        }
+
+        // Find player in game state
+        const playerInGame = game.players.find((p) => p.id === player.id)
+        if (!playerInGame) {
+          toast({
+            title: "Player not found",
+            description: "You're not part of this game.",
+            variant: "destructive",
+          })
+          router.push("/")
+          return
+        }
+
+        setCurrentPlayer(playerInGame)
+
+        // If voting is complete, show results
+        if (game.votingComplete && !resultsOpen) {
           setResultsOpen(true)
         }
+      } catch (error) {
+        console.error('Error loading game:', error)
+        toast({
+          title: "Error loading game",
+          description: "Please try again.",
+          variant: "destructive",
+        })
+        router.push("/")
       }
-    }, 1000)
-
-    return () => clearInterval(interval)
-  }, [gameCode, router, toast])
-
-  const handleStartVoting = () => {
-    if (!gameState) return
-
-    const updatedGame = {
-      ...gameState,
-      votes: {},
-      votingComplete: false,
-      mafiaRevealed: false,
     }
 
-    localStorage.setItem(`game_${gameCode}`, JSON.stringify(updatedGame))
-    setGameState(updatedGame)
-    setVotingOpen(true)
+    loadGame()
+
+    // Subscribe to game changes
+    const subscription = supabase
+      .channel(`game_${gameCode}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'games',
+          filter: `code=eq.${gameCode}`,
+        },
+        (payload) => {
+          const updatedGame = payload.new as GameState
+          setGameState(updatedGame)
+
+          // Update current player info
+          if (currentPlayer) {
+            const updatedPlayer = updatedGame.players.find((p) => p.id === currentPlayer.id)
+            if (updatedPlayer) {
+              setCurrentPlayer(updatedPlayer)
+            }
+          }
+
+          // Show results if voting is complete
+          if (updatedGame.votingComplete && !resultsOpen) {
+            setResultsOpen(true)
+          }
+        }
+      )
+      .subscribe()
+
+    return () => {
+      subscription.unsubscribe()
+    }
+  }, [gameCode, router, toast, currentPlayer, resultsOpen])
+
+  const handleStartVoting = async () => {
+    if (!gameState) return
+
+    try {
+      const { error } = await supabase
+        .from('games')
+        .update({
+          votes: {},
+          votingComplete: false,
+          mafiaRevealed: false,
+        })
+        .eq('code', gameCode)
+
+      if (error) throw error
+
+      setVotingOpen(true)
+    } catch (error) {
+      console.error('Error starting voting:', error)
+      toast({
+        title: "Error starting voting",
+        description: "Please try again.",
+        variant: "destructive",
+      })
+    }
   }
 
-  const handleVote = () => {
+  const handleVote = async () => {
     if (!gameState || !currentPlayer || selectedPlayer === null) return
 
-    // Record vote
-    const updatedVotes = { ...(gameState.votes || {}) }
-    updatedVotes[currentPlayer.id] = selectedPlayer
+    try {
+      // Record vote
+      const updatedVotes = { ...(gameState.votes || {}) }
+      updatedVotes[currentPlayer.id] = selectedPlayer
 
-    const updatedGame = {
-      ...gameState,
-      votes: updatedVotes,
+      // Check if all players have voted
+      const voteCount = Object.keys(updatedVotes).length
+      const votingComplete = voteCount === gameState.players.length
+
+      // Update game state
+      const { error } = await supabase
+        .from('games')
+        .update({
+          votes: updatedVotes,
+          votingComplete,
+        })
+        .eq('code', gameCode)
+
+      if (error) throw error
+
+      setVotingOpen(false)
+      toast({
+        title: "Vote recorded",
+        description: "Your vote has been recorded.",
+      })
+    } catch (error) {
+      console.error('Error recording vote:', error)
+      toast({
+        title: "Error recording vote",
+        description: "Please try again.",
+        variant: "destructive",
+      })
     }
-
-    // Check if all players have voted
-    const voteCount = Object.keys(updatedVotes).length
-    if (voteCount === gameState.players.length) {
-      updatedGame.votingComplete = true
-    }
-
-    localStorage.setItem(`game_${gameCode}`, JSON.stringify(updatedGame))
-    setGameState(updatedGame)
-    setVotingOpen(false)
-
-    toast({
-      title: "Vote recorded",
-      description: "Your vote has been recorded.",
-    })
   }
 
-  const handleRevealMafias = () => {
+  const handleRevealMafias = async () => {
     if (!gameState) return
 
-    const updatedGame = {
-      ...gameState,
-      mafiaRevealed: true,
-    }
+    try {
+      const { error } = await supabase
+        .from('games')
+        .update({
+          mafiaRevealed: true,
+        })
+        .eq('code', gameCode)
 
-    localStorage.setItem(`game_${gameCode}`, JSON.stringify(updatedGame))
-    setGameState(updatedGame)
+      if (error) throw error
+    } catch (error) {
+      console.error('Error revealing mafias:', error)
+      toast({
+        title: "Error revealing mafias",
+        description: "Please try again.",
+        variant: "destructive",
+      })
+    }
   }
 
-  const handlePlayAgain = () => {
+  const handlePlayAgain = async () => {
     if (!gameState || !gameCode) return
 
-    // Reset game state to lobby
-    const updatedGame = {
-      ...gameState,
-      status: "lobby",
-      votes: {},
-      votingComplete: false,
-      mafiaRevealed: false,
-    }
+    try {
+      // Reset game state to lobby
+      const { error } = await supabase
+        .from('games')
+        .update({
+          status: "lobby",
+          votes: {},
+          votingComplete: false,
+          mafiaRevealed: false,
+          players: gameState.players.map(p => ({ ...p, isMafia: false })),
+        })
+        .eq('code', gameCode)
 
-    localStorage.setItem(`game_${gameCode}`, JSON.stringify(updatedGame))
-    router.push(`/lobby?code=${gameCode}`)
+      if (error) throw error
+
+      router.push(`/lobby?code=${gameCode}`)
+    } catch (error) {
+      console.error('Error resetting game:', error)
+      toast({
+        title: "Error resetting game",
+        description: "Please try again.",
+        variant: "destructive",
+      })
+    }
   }
 
   const getVoteCounts = () => {
     if (!gameState || !gameState.votes) return {}
 
     const voteCounts: Record<number, number> = {}
-
     Object.values(gameState.votes).forEach((votedId) => {
       voteCounts[votedId] = (voteCounts[votedId] || 0) + 1
     })
-
     return voteCounts
   }
 

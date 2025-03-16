@@ -8,24 +8,8 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Copy, Users } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
-
-interface Player {
-  id: number
-  name: string
-  isMafia?: boolean
-}
-
-interface GameState {
-  code: string
-  host: string
-  playerCount: number
-  mafiaCount: number
-  players: Player[]
-  normalWord: string
-  mafiaWord: string
-  status: string
-  created: string
-}
+import { supabase } from "@/lib/supabase"
+import type { GameState, Player } from "@/lib/supabase"
 
 export default function LobbyPage() {
   const router = useRouter()
@@ -44,127 +28,158 @@ export default function LobbyPage() {
       return
     }
 
-    // Load game state
-    const storedGame = localStorage.getItem(`game_${gameCode}`)
-    if (!storedGame) {
-      toast({
-        title: "Game not found",
-        description: "The game code you entered doesn't exist.",
-        variant: "destructive",
-      })
-      router.push("/")
-      return
-    }
+    // Load game state and set up real-time subscription
+    const loadGame = async () => {
+      try {
+        // Get initial game state
+        const { data: game, error } = await supabase
+          .from('games')
+          .select('*')
+          .eq('code', gameCode)
+          .single()
 
-    const parsedGame = JSON.parse(storedGame) as GameState
-    setGameState(parsedGame)
+        if (error) throw error
 
-    // Check if player is already in the game
-    const storedPlayer = localStorage.getItem("currentPlayer")
-    if (storedPlayer) {
-      const player = JSON.parse(storedPlayer)
-      if (player.gameCode === gameCode) {
-        setCurrentPlayer(player)
-        setIsJoining(false)
-      } else {
-        setIsJoining(true)
-      }
-    } else {
-      setIsJoining(true)
-    }
-
-    // Set up polling to check for game updates
-    const interval = setInterval(() => {
-      const updatedGame = localStorage.getItem(`game_${gameCode}`)
-      if (updatedGame) {
-        const parsed = JSON.parse(updatedGame)
-        setGameState(parsed)
-
-        // If game has started, redirect to game page
-        if (parsed.status === "playing") {
-          router.push(`/game?code=${gameCode}`)
+        if (!game) {
+          toast({
+            title: "Game not found",
+            description: "The game you're looking for doesn't exist.",
+            variant: "destructive",
+          })
+          router.push("/")
+          return
         }
-      }
-    }, 1000)
 
-    return () => clearInterval(interval)
+        setGameState(game)
+
+        // Check if player is already in the game
+        const storedPlayer = localStorage.getItem("currentPlayer")
+        if (storedPlayer) {
+          const player = JSON.parse(storedPlayer)
+          if (player.gameCode === gameCode) {
+            const playerInGame = game.players.find((p: Player) => p.id === player.id)
+            if (playerInGame) {
+              setCurrentPlayer(playerInGame)
+              setIsJoining(false)
+              return
+            }
+          }
+        }
+        setIsJoining(true)
+      } catch (error) {
+        console.error('Error loading game:', error)
+        toast({
+          title: "Error loading game",
+          description: "Please try again.",
+          variant: "destructive",
+        })
+        router.push("/")
+      }
+    }
+
+    loadGame()
+
+    // Subscribe to game changes
+    const subscription = supabase
+      .channel(`game_${gameCode}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'games',
+          filter: `code=eq.${gameCode}`,
+        },
+        (payload) => {
+          const updatedGame = payload.new as GameState
+          setGameState(updatedGame)
+
+          // If game has started, redirect to game page
+          if (updatedGame.status === "playing") {
+            router.push(`/game?code=${gameCode}`)
+          }
+        }
+      )
+      .subscribe()
+
+    return () => {
+      subscription.unsubscribe()
+    }
   }, [gameCode, router, toast])
 
-  const handleJoinGame = () => {
-    if (!gameState || !playerName.trim()) return
-
-    // Get latest game state to avoid race conditions
-    const latestGameState = localStorage.getItem(`game_${gameCode}`)
-    if (!latestGameState) {
-      toast({
-        title: "Game not found",
-        description: "The game you're trying to join no longer exists.",
-        variant: "destructive",
-      })
-      router.push("/")
-      return
-    }
-
-    const parsedGame = JSON.parse(latestGameState) as GameState
-    
-    // Check if game is still in lobby
-    if (parsedGame.status !== "lobby") {
-      toast({
-        title: "Game already started",
-        description: "This game has already started. You cannot join now.",
-        variant: "destructive",
-      })
-      router.push("/")
-      return
-    }
-
-    // Check if game is full
-    if (parsedGame.players.length >= parsedGame.playerCount) {
-      toast({
-        title: "Game is full",
-        description: "This game has reached its maximum number of players.",
-        variant: "destructive",
-      })
-      router.push("/")
-      return
-    }
-
-    // Check if name is already taken
-    if (parsedGame.players.some(p => p.name === playerName)) {
-      toast({
-        title: "Name already taken",
-        description: "Please choose a different name.",
-        variant: "destructive",
-      })
-      return
-    }
-
-    // Add player to game
-    const newPlayer = {
-      id: parsedGame.players.length + 1,
-      name: playerName,
-      isMafia: false, // Will be assigned during game start
-    }
-
-    const updatedPlayers = [...parsedGame.players, newPlayer]
-    const updatedGame = {
-      ...parsedGame,
-      players: updatedPlayers,
-    }
+  const handleJoinGame = async () => {
+    if (!gameState || !playerName.trim() || isJoining) return
 
     try {
-      localStorage.setItem(`game_${gameCode}`, JSON.stringify(updatedGame))
+      // Get latest game state to avoid race conditions
+      const { data: latestGame, error: fetchError } = await supabase
+        .from('games')
+        .select('*')
+        .eq('code', gameCode)
+        .single()
+
+      if (fetchError) throw fetchError
+
+      // Check if game is still in lobby
+      if (latestGame.status !== "lobby") {
+        toast({
+          title: "Game already started",
+          description: "This game has already started. You cannot join now.",
+          variant: "destructive",
+        })
+        router.push("/")
+        return
+      }
+
+      // Check if game is full
+      if (latestGame.players.length >= latestGame.playerCount) {
+        toast({
+          title: "Game is full",
+          description: "This game has reached its maximum number of players.",
+          variant: "destructive",
+        })
+        router.push("/")
+        return
+      }
+
+      // Check if name is already taken
+      if (latestGame.players.some(p => p.name === playerName)) {
+        toast({
+          title: "Name already taken",
+          description: "Please choose a different name.",
+          variant: "destructive",
+        })
+        return
+      }
+
+      // Add player to game
+      const newPlayer = {
+        id: latestGame.players.length + 1,
+        name: playerName,
+        isMafia: false, // Will be assigned during game start
+      }
+
+      const updatedPlayers = [...latestGame.players, newPlayer]
+      
+      // Update game in Supabase
+      const { error: updateError } = await supabase
+        .from('games')
+        .update({ players: updatedPlayers })
+        .eq('code', gameCode)
+
+      if (updateError) throw updateError
+
+      // Store current player info
       localStorage.setItem(
         "currentPlayer",
         JSON.stringify({
           id: newPlayer.id,
           name: playerName,
           gameCode,
-        }),
+        })
       )
 
       setCurrentPlayer(newPlayer)
-      setGameState(updatedGame)
       setIsJoining(false)
 
       toast({
@@ -172,15 +187,16 @@ export default function LobbyPage() {
         description: "You have successfully joined the game.",
       })
     } catch (error) {
+      console.error('Error joining game:', error)
       toast({
         title: "Error joining game",
-        description: "There was an error joining the game. Please try again.",
+        description: "Please try again.",
         variant: "destructive",
       })
     }
   }
 
-  const handleStartGame = () => {
+  const handleStartGame = async () => {
     if (!gameState) return
 
     // Need at least 3 players to start
@@ -193,30 +209,43 @@ export default function LobbyPage() {
       return
     }
 
-    // Assign mafia roles randomly
-    const playersCopy = [...gameState.players]
+    try {
+      // Assign mafia roles randomly
+      const playersCopy = [...gameState.players]
+      
+      // Reset all mafia assignments
+      playersCopy.forEach((p) => (p.isMafia = false))
 
-    // Reset all mafia assignments
-    playersCopy.forEach((p) => (p.isMafia = false))
+      // Randomly assign mafia roles
+      const mafiaCount = Math.min(gameState.mafiaCount, Math.floor(playersCopy.length / 2))
+      const indices = Array.from({ length: playersCopy.length }, (_, i) => i)
 
-    // Randomly assign mafia roles
-    const mafiaCount = Math.min(gameState.mafiaCount, Math.floor(playersCopy.length / 2))
-    const indices = Array.from({ length: playersCopy.length }, (_, i) => i)
+      for (let i = 0; i < mafiaCount; i++) {
+        const randomIndex = Math.floor(Math.random() * indices.length)
+        const playerIndex = indices.splice(randomIndex, 1)[0]
+        playersCopy[playerIndex].isMafia = true
+      }
 
-    for (let i = 0; i < mafiaCount; i++) {
-      const randomIndex = Math.floor(Math.random() * indices.length)
-      const playerIndex = indices.splice(randomIndex, 1)[0]
-      playersCopy[playerIndex].isMafia = true
+      // Update game state in Supabase
+      const { error } = await supabase
+        .from('games')
+        .update({
+          players: playersCopy,
+          status: "playing",
+        })
+        .eq('code', gameCode)
+
+      if (error) throw error
+
+      router.push(`/game?code=${gameCode}`)
+    } catch (error) {
+      console.error('Error starting game:', error)
+      toast({
+        title: "Error starting game",
+        description: "Please try again.",
+        variant: "destructive",
+      })
     }
-
-    const updatedGame = {
-      ...gameState,
-      players: playersCopy,
-      status: "playing",
-    }
-
-    localStorage.setItem(`game_${gameCode}`, JSON.stringify(updatedGame))
-    router.push(`/game?code=${gameCode}`)
   }
 
   const copyGameCode = () => {
@@ -284,12 +313,14 @@ export default function LobbyPage() {
                   {gameState.players.map((player) => (
                     <li key={player.id} className="flex items-center justify-between py-1 px-2 rounded-md bg-muted/50">
                       <span>{player.name}</span>
-                      {player.name === gameState.host && (
-                        <span className="text-xs bg-primary/20 text-primary px-2 py-0.5 rounded-full">Host</span>
-                      )}
-                      {player.id === currentPlayer?.id && (
-                        <span className="text-xs bg-secondary/20 text-secondary px-2 py-0.5 rounded-full">You</span>
-                      )}
+                      <div className="flex items-center space-x-1">
+                        {player.name === gameState.host && (
+                          <span className="text-xs bg-primary/20 text-primary px-2 py-0.5 rounded-full">Host</span>
+                        )}
+                        {player.id === currentPlayer?.id && (
+                          <span className="text-xs bg-secondary/20 text-secondary px-2 py-0.5 rounded-full">You</span>
+                        )}
+                      </div>
                     </li>
                   ))}
                 </ul>
